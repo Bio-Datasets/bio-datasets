@@ -321,7 +321,9 @@ def load_structure(
     if isinstance(fpath_or_handler, (str, PathLike)) and fpath_or_handler.endswith(
         ".gz"
     ):
-        file_type = os.path.splitext(os.path.splitext(fpath_or_handler)[0])[1][1:]
+        file_type = (
+            file_type or os.path.splitext(os.path.splitext(fpath_or_handler)[0])[1][1:]
+        )
         # https://github.com/biotite-dev/biotite/issues/193
         with gzip.open(fpath_or_handler, "rt") as f:
             return load_structure(

@@ -10,7 +10,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from io import BytesIO, StringIO
-from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Optional, Union
 
 import numpy as np
 import pyarrow as pa
@@ -59,17 +59,6 @@ def element_from_atom_name(atom_name: np.ndarray, molecule_type: np.ndarray):
     # TODO: write a vectorised version
     # I think there is actually ambiguity here - CA can be alpha carbon or Calcium...
     raise NotImplementedError()
-
-
-def infer_bytes_format(b: bytes) -> str:
-    """
-    Infer the file format of a bytes object from its contents.
-    """
-    if b.startswith(b"FCMP"):
-        return "fcz"
-    else:
-        # otherwise, assume pdb for now
-        return "pdb"
 
 
 def protein_atom_array_from_dict(
@@ -137,21 +126,6 @@ def encode_biotite_atom_array(
         return contents.encode()
 
 
-def infer_type_from_structure_file_dict(d: dict) -> Tuple[Optional[str], Optional[str]]:
-    if "type" in d and d["type"] is not None:
-        return d["type"]
-    elif "path" in d:
-        path = d["path"]
-        if path.endswith(".gz"):
-            path = path[:-3]
-        ext = xsplitext(path)[1][1:]
-        return ext
-    elif "bytes" in d:
-        return infer_bytes_format(d["bytes"])
-    else:
-        return None
-
-
 def load_structure_from_file_dict(
     d: dict,
     token_per_repo_id: Optional[Dict[str, int]] = None,
@@ -160,28 +134,27 @@ def load_structure_from_file_dict(
     token_per_repo_id = token_per_repo_id or {}
 
     path, bytes_ = d.get("path"), d.get("bytes")
-    file_type = infer_type_from_structure_file_dict(d)
+    file_type = d["type"]
+    assert file_type is not None
 
     if bytes_ is None:
+        assert path is not None, "path is required when bytes is None"
         return _load_from_path(path, file_type, extra_fields, token_per_repo_id, d)
     else:
-        return _load_from_bytes(path, bytes_, file_type, extra_fields)
+        return _load_from_bytes(bytes_, file_type, extra_fields)
 
 
 def _load_from_path(
     path: Optional[str],
-    file_type: Optional[str],
+    file_type: str,
     extra_fields: Optional[List[str]],
     token_per_repo_id: Dict[str, int],
-    d: dict,
 ) -> bs.AtomArray:
-    if path is None:
-        raise ValueError(
-            f"A structure should have one of 'path' or 'bytes' but both are None in {d}."
-        )
 
     if is_local_path(path):
-        return load_structure(path, file_format=file_type, extra_fields=extra_fields)
+        return load_structure(
+            path, file_type=file_type.replace(".gz", ""), extra_fields=extra_fields
+        )
 
     source_url = path.split("::")[-1]
     pattern = (
@@ -197,42 +170,30 @@ def _load_from_path(
 
     download_config = DownloadConfig(token=token)
     with xopen(path, "r", download_config=download_config) as f:
-        return load_structure(
-            f, file_type=file_type or "pdb", extra_fields=extra_fields
-        )
+        return load_structure(f, file_type=file_type, extra_fields=extra_fields)
 
 
 def _load_from_bytes(
-    path: Optional[str],
     bytes_: bytes,
-    file_type: Optional[str],
+    file_type: str,
     extra_fields: Optional[List[str]],
 ) -> bs.AtomArray:
-    if path is not None:
-        fhandler = _get_file_handler(bytes_, file_type)
-        return load_structure(fhandler, file_type=file_type, extra_fields=extra_fields)
-
-    file_type = infer_bytes_format(bytes_)
-    pdb = _decode_bytes(bytes_, file_type)
-    contents = StringIO(pdb)
-    return load_structure(contents, file_type="pdb", extra_fields=extra_fields)
+    fhandler = _file_handler_from_bytes(bytes_, file_type)
+    return load_structure(
+        fhandler, file_type=file_type.replace(".gz", ""), extra_fields=extra_fields
+    )
 
 
-def _get_file_handler(bytes_: bytes, file_type: Optional[str]):
-    if file_type == "fcz":
+def _file_handler_from_bytes(bytes_: bytes, file_type: Optional[str]):
+    if file_type in ["fcz", "bcif"]:
         return BytesIO(bytes_)
+    elif file_type.endswith(".gz"):
+        decompressed = gzip.decompress(bytes_)
+        return _file_handler_from_bytes(decompressed, file_type[:-3])
     elif file_type in ["pdb", "cif"]:
         return StringIO(bytes_.decode())
     else:
         raise ValueError(f"Unsupported file type: {file_type} for bytes input")
-
-
-def _decode_bytes(bytes_: bytes, file_type: Optional[str]) -> str:
-    if file_type == "fcz":
-        _, pdb = foldcomp.decompress(bytes_)
-    else:
-        pdb = bytes_.decode()
-    return pdb
 
 
 @dataclass
@@ -508,11 +469,12 @@ class AtomArrayFeature(CustomFeature):
         raise ValueError(f"Path does not exist: {value}")
 
     def _encode_bytes(self, value: bytes) -> dict:
-        file_type = infer_bytes_format(value)
-        fhandler = BytesIO(value)
-        return self.encode_example(
-            load_structure(fhandler, format=file_type, extra_fields=self.extra_fields)
-        )
+        raise NotImplementedError("Not implemented")
+        # file_type = infer_bytes_format(value)
+        # fhandler = BytesIO(value)
+        # return self.encode_example(
+        #     load_structure(fhandler, format=file_type, extra_fields=self.extra_fields)
+        # )
 
     def _decode_atoms(self, value, token_per_repo_id=None):
         if not isinstance(value["coords"], (np.ndarray, list)):
@@ -608,6 +570,14 @@ class AtomArrayFeature(CustomFeature):
             raise ValueError(f"Unsupported load_as: {self.load_as}")
 
 
+def file_type_from_path(path: str) -> str:
+    if os.path.splitext(path)[1] == ".gz":
+        base = os.path.splitext(os.path.splitext(path)[0])[1][1:]
+        return base + ".gz"
+    else:
+        return os.path.splitext(path)[1][1:]
+
+
 @dataclass
 class StructureFeature(CustomFeature):
     """Structure [`Feature`] to read (bio)molecular atomic structure data from supported file types.
@@ -650,6 +620,7 @@ class StructureFeature(CustomFeature):
     with_atom_id: bool = False
     with_charge: bool = False
     encode_with_foldcomp: bool = False
+    compression: Optional[str] = None  # "gzip" or "foldcomp" or None
     pa_type: ClassVar[Any] = pa.struct(
         {"bytes": pa.binary(), "path": pa.string(), "type": pa.string()}
     )
@@ -686,16 +657,33 @@ class StructureFeature(CustomFeature):
         return extra_fields
 
     def _encode_dict(self, value: dict) -> dict:
-        file_type = infer_type_from_structure_file_dict(value)
         if value.get("path") is not None and os.path.isfile(value["path"]):
             path = value["path"]
-            # we set "bytes": None to not duplicate the data if they're already available locally
+            file_type = value.get("type") or file_type_from_path(path)
+            # we set "bytes": None to not duplicate the data if they're already available locally; embedding happens later
             # (this assumes invocation in what context?)
-            return {"bytes": None, "path": path, "type": file_type or "pdb"}
-        elif value.get("bytes") is not None or value.get("path") is not None:
+            return {"bytes": None, "path": path, "type": file_type}
+        elif value.get("bytes") is not None:
             # store the Structure bytes, and path is optionally used to infer the Structure format using the file extension
             path = value.get("path")
-            return {"bytes": value.get("bytes"), "path": path, "type": file_type}
+            file_type = value.get("type")
+            if file_type is None and path is not None:
+                file_type = os.path.splitext(path)[1][1:].lower()
+            if self.compression == "gzip":
+                assert not file_type.endswith(
+                    ".gz"
+                ), "Gzipped files should not be compressed again"
+                value["bytes"] = gzip.compress(value["bytes"])
+                value["type"] = value["type"] + ".gz"
+            elif self.compression == "foldcomp":
+                assert (
+                    file_type == "pdb"
+                ), "foldcomp compression only supported for PDB files"
+                value["bytes"] = foldcomp.compress(value["bytes"])
+                value["type"] = "fcz"
+            elif self.compression is not None:
+                raise ValueError(f"Unsupported compression: {self.compression}")
+            return {"bytes": value["bytes"], "path": path, "type": file_type}
         else:
             raise ValueError(
                 f"A structure sample should have one of 'path' or 'bytes' but they are missing or None in {value}."
@@ -703,6 +691,9 @@ class StructureFeature(CustomFeature):
 
     def _encode_example(self, value: Union[str, bytes, bs.AtomArray]) -> dict:
         """Encode example into a format for Arrow.
+
+        Similar to the built-in Image/Audio features, we allow for file contents to be written
+        to the dataset only when pushing to the Hub, to avoid duplicating locally stored files.
 
         This determines what gets written to the Arrow file.
         """
@@ -807,12 +798,18 @@ class StructureFeature(CustomFeature):
 
         @no_op_if_value_is_null
         def path_to_bytes(path):
+            # could be gzipped or foldcomp compressed already
             with xopen(path, "rb") as f:
                 bytes_ = f.read()
-            if path.endswith(".gz"):
-                assert is_local_path(path), "Gzipped files must have local file paths."
-                with gzip.open(path, "rb") as f:
-                    bytes_ = f.read()
+            if self.compression == "gzip" and not path.endswith(".gz"):
+                bytes_ = gzip.compress(bytes_)
+            elif self.compression == "foldcomp" and not path.endswith(".fcz"):
+                assert path.endswith(
+                    ".pdb"
+                ), "foldcomp compression only supported for PDB files"
+                bytes_ = foldcomp.compress(bytes_)
+            elif self.compression is not None:
+                raise ValueError(f"Unsupported compression: {self.compression}")
             return bytes_
 
         bytes_array = pa.array(
